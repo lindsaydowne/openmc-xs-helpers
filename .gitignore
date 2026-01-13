@@ -10,3 +10,10 @@ dist/
 Thumbs.db
 .vscode/
 .idea/
+
+materials.xml
+
+
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+

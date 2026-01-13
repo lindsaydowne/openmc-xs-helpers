@@ -10,6 +10,7 @@ from .xs_helpers import (
 
 __all__ = [
     "AvailableReactions",
+    "available_library_reactions",
     "available_reactions",
     "peak_cross_section",
     "cross_section_at_energy",

@@ -6,6 +6,7 @@ directly from the OpenMC HDF5 libraries referenced by cross_sections.xml.
 
 Public API:
     - AvailableReactions
+    - available_library_reactions
     - available_reactions
     - peak_cross_section
     - cross_section_at_energy
@@ -39,6 +40,7 @@ __all__ = [
     "FUSION_E_MAX_eV",
     "Y_LOG_FLOOR",
     "AvailableReactions",
+    "available_library_reactions",
     "available_reactions",
     "peak_cross_section",
     "cross_section_at_energy",
@@ -471,10 +473,60 @@ def _parse_mt_or_reaction(data: IncidentNeutron, reaction_or_mt: Any, nuc: str) 
 def _excluded_default_mts(exclude_scattering: bool = True, exclude_derived: bool = True) -> set[int]:
     excluded: set[int] = set()
     if exclude_scattering:
-        excluded |= set(range(53, 91))
+        excluded |= set(range(53, 92))
     if exclude_derived:
         excluded |= set(range(301, 902))
     return excluded
+
+
+def available_library_reactions(
+    xs_xml_path=None,
+    max_nuclides=None,
+    exclude_scattering=True,
+    exclude_derived=True,
+    as_available_reactions=True,
+    verbose=True,
+):
+    """
+    Scan the entire cross_sections.xml neutron library and return the union of MTs
+    present across all nuclides.
+
+    This is a *global* library query (not target-specific).
+    """
+    nuclide_to_h5, _ = _get_xsxml_maps(xs_xml_path=xs_xml_path)
+
+    items = list(nuclide_to_h5.items())
+    if max_nuclides is not None:
+        items = items[: int(max_nuclides)]
+
+    excluded = _excluded_default_mts(
+        exclude_scattering=exclude_scattering,
+        exclude_derived=exclude_derived,
+    )
+
+    mts = set()
+    missing = 0
+
+    for nuc, h5 in items:
+        h5 = Path(h5)
+        if not h5.exists():
+            missing += 1
+            continue
+        data = _get_incident_neutron(h5)
+        for mt in map(int, data.reactions.keys()):
+            if mt not in excluded:
+                mts.add(mt)
+
+    mts = sorted(mts)
+
+    if verbose:
+        xs_xml = _xs_xml_path(xs_xml_path)
+        print(f"cross_sections.xml: {xs_xml}")
+        print(f"nuclides scanned: {len(items)} (missing files: {missing})")
+        print(f"unique MTs found: {len(mts)}")
+
+    return AvailableReactions(mts, label="library") if as_available_reactions else mts
+
 
 
 def available_reactions(
@@ -1117,6 +1169,8 @@ def plot_xs(
       - X toggle: linear in MeV, log in eV (updates axis + trace x arrays)
       - Y toggle: log decades 10^k (with floor), or linear sci notation
       - Mode toggle: micro / micro×atom / macro
+      - If reactions_or_mts is omitted, it plots the top N dominant reactions for each mode (N=top_n).
+
     """
     groups = _resolve_targets(targets, xs_xml_path=xs_xml_path)
     T = _normalize_temperature("294K" if temperature is None else temperature) or "294K"
@@ -1125,6 +1179,9 @@ def plot_xs(
         target_label = group["title"]
         nucs = [_normalize_nuclide_name(r["name"]) for r in group["nuclide_rows"]]
 
+        # Single-nuclide target (e.g. "Gd157") => mode buttons are redundant
+        single_nuclide = (group.get("target_kind") == "nuclide" and len(nucs) == 1)
+        
         if verbose:
             print(f"[plot] Reading nuclide data for {target_label} at {T}...")
 
@@ -1146,8 +1203,8 @@ def plot_xs(
             continue
 
         micro_curves: list[dict[str, Any]] = []
-        scaled_curves: list[dict[str, Any]] = []
-        macro_components: dict[int, dict[str, Any]] = {}
+        scaled_curves: list[dict[str, Any]] | None = [] if not single_nuclide else None
+        macro_components: dict[int, dict[str, Any]] | None = {} if not single_nuclide else None
 
         for nuc in nucs:
             # resolve req list per nuclide if reaction strings
@@ -1172,15 +1229,20 @@ def plot_xs(
                     continue
                 E_eV, xs_b, mt_res, rxname, _T_use = out
 
-                micro_curves.append(
-                    {"nuc": nuc, "req": req, "mt": mt_res, "rxname": rxname, "E_eV": E_eV, "y": xs_b}
-                )
-                scaled_curves.append(
-                    {"nuc": nuc, "req": req, "mt": mt_res, "rxname": rxname, "E_eV": E_eV, "y": w * xs_b, "w": w}
-                )
-
-                macro_components.setdefault(mt_res, {"rxname": rxname, "parts": []})
-                macro_components[mt_res]["parts"].append({"E": E_eV, "y": xs_b, "w": w})
+                micro_curves.append({
+                    "nuc": nuc, "req": req, "mt": mt_res, "rxname": rxname,
+                    "E_eV": E_eV, "y": xs_b
+                })
+                
+                if not single_nuclide:
+                    scaled_curves.append({
+                        "nuc": nuc, "req": req, "mt": mt_res, "rxname": rxname,
+                        "E_eV": E_eV, "y": w * xs_b, "w": w
+                    })
+                
+                    macro_components.setdefault(mt_res, {"rxname": rxname, "parts": []})
+                    macro_components[mt_res]["parts"].append({"E": E_eV, "y": xs_b, "w": w})
+                
 
         if not micro_curves:
             print(f"{target_label}: no curves found at {T}.")
@@ -1193,42 +1255,49 @@ def plot_xs(
 
         if requested_is_auto:
             micro_sel = sorted(micro_curves, key=_curve_metric, reverse=True)[:top_n]
-            scaled_sel = sorted(scaled_curves, key=_curve_metric, reverse=True)[:top_n]
+            if not single_nuclide:
+                scaled_sel = sorted(scaled_curves, key=_curve_metric, reverse=True)[:top_n]
         else:
             micro_sel = sorted(micro_curves, key=_curve_metric, reverse=True)
-            scaled_sel = sorted(scaled_curves, key=_curve_metric, reverse=True)
+            if not single_nuclide:
+                scaled_sel = sorted(scaled_curves, key=_curve_metric, reverse=True)
 
         macro_sel: list[dict[str, Any]] = []
-        for mt, info in macro_components.items():
-            parts = info["parts"]
-            if not parts:
-                continue
-            E_union = np.unique(np.concatenate([np.asarray(p["E"], float) for p in parts]))
-            E_union.sort()
-            y_sum = np.zeros_like(E_union, dtype=float)
-            for p in parts:
-                y_sum += p["w"] * _interp_to(p["E"], p["y"], E_union)
-            macro_sel.append({"mt": mt, "rxname": info["rxname"], "E_eV": E_union, "y": y_sum})
+        if not single_nuclide:
+            for mt, info in macro_components.items():
+                parts = info["parts"]
+                if not parts:
+                    continue
+                E_union = np.unique(np.concatenate([np.asarray(p["E"], float) for p in parts]))
+                E_union.sort()
+                y_sum = np.zeros_like(E_union, dtype=float)
+                for p in parts:
+                    y_sum += p["w"] * _interp_to(p["E"], p["y"], E_union)
+                macro_sel.append({"mt": mt, "rxname": info["rxname"], "E_eV": E_union, "y": y_sum})
+        if not single_nuclide:
+            if requested_is_auto:
+                macro_sel = sorted(macro_sel, key=_curve_metric, reverse=True)[:top_n]
+            else:
+                macro_sel = sorted(macro_sel, key=_curve_metric, reverse=True)
 
-        if requested_is_auto:
-            macro_sel = sorted(macro_sel, key=_curve_metric, reverse=True)[:top_n]
-        else:
-            macro_sel = sorted(macro_sel, key=_curve_metric, reverse=True)
-
-        # title + suffix
+       # title (centered; no "Target:" prefix anywhere)
         if reactions_or_mts is None:
+            n = int(top_n) if top_n is not None else 10
             title_text = f"Neutron cross sections for {target_label} at {T}."
-            suffix = " top 10"
+            suffix = f" top {n}"
         else:
             mts = sorted(set([c["mt"] for c in micro_sel] + [c["mt"] for c in macro_sel]))
             rx_mt = [f"{REACTION_NAME.get(mt, f'MT{mt}')} (MT={mt})" for mt in mts]
             title_text = f"{_join_english(rx_mt)} neutron cross section for {target_label} at {T}."
             suffix = ""
 
+
         # y axis configurations (each includes floor)
         y_micro_log = _yaxis_log_decades([c["y"] for c in micro_sel], "cross section [b]")
-        y_scaled_log = _yaxis_log_decades([c["y"] for c in scaled_sel], "cross section [b]")
-        y_macro_log = _yaxis_log_decades([c["y"] for c in macro_sel], "cross section [b]")
+        
+        if not single_nuclide:
+            y_scaled_log = _yaxis_log_decades([c["y"] for c in scaled_sel], "cross section [b]")
+            y_macro_log = _yaxis_log_decades([c["y"] for c in macro_sel], "cross section [b]")
 
         fig = go.Figure()
 
@@ -1250,18 +1319,19 @@ def plot_xs(
             _add_trace(c["E_eV"], c["y"], f"{c['nuc']} {c['rxname']} (MT={c['mt']})", True)
             idx_micro.append(len(fig.data) - 1)
 
-        for c in scaled_sel:
-            _add_trace(
-                c["E_eV"],
-                c["y"],
-                f"{c['nuc']} a·{c['rxname']} (a={c.get('w',0):.3g}, MT={c['mt']})",
-                False,
-            )
-            idx_scaled.append(len(fig.data) - 1)
-
-        for c in macro_sel:
-            _add_trace(c["E_eV"], c["y"], f"{c['rxname']} (MT={c['mt']})", False)
-            idx_macro.append(len(fig.data) - 1)
+        if not single_nuclide:
+            for c in scaled_sel:
+                _add_trace(
+                    c["E_eV"],
+                    c["y"],
+                    f"{c['nuc']} a·{c['rxname']} (a={c.get('w',0):.3g}, MT={c['mt']})",
+                    False,
+                )
+                idx_scaled.append(len(fig.data) - 1)
+    
+            for c in macro_sel:
+                _add_trace(c["E_eV"], c["y"], f"{c['rxname']} (MT={c['mt']})", False)
+                idx_macro.append(len(fig.data) - 1)
 
         n_tr = len(fig.data)
         vis_micro = [False] * n_tr
@@ -1274,23 +1344,24 @@ def plot_xs(
         for i in idx_macro:
             vis_macro[i] = True
 
-        mode_buttons = [
-            dict(
-                label=f"microscopic{suffix}",
-                method="update",
-                args=[{"visible": vis_micro}, {"yaxis": {**y_micro_log, "title": {"text": "cross section [b]"}}}],
-            ),
-            dict(
-                label=f"microscopic × atom fraction{suffix}",
-                method="update",
-                args=[{"visible": vis_scaled}, {"yaxis": {**y_scaled_log, "title": {"text": "cross section [b]"}}}],
-            ),
-            dict(
-                label=f"macroscopic{suffix}",
-                method="update",
-                args=[{"visible": vis_macro}, {"yaxis": {**y_macro_log, "title": {"text": "cross section [b]"}}}],
-            ),
-        ]
+        if not single_nuclide:
+            mode_buttons = [
+                dict(
+                    label=f"microscopic{suffix}",
+                    method="update",
+                    args=[{"visible": vis_micro}, {"yaxis": {**y_micro_log, "title": {"text": "cross section [b]"}}}],
+                ),
+                dict(
+                    label=f"microscopic × atom fraction{suffix}",
+                    method="update",
+                    args=[{"visible": vis_scaled}, {"yaxis": {**y_scaled_log, "title": {"text": "cross section [b]"}}}],
+                ),
+                dict(
+                    label=f"macroscopic{suffix}",
+                    method="update",
+                    args=[{"visible": vis_macro}, {"yaxis": {**y_macro_log, "title": {"text": "cross section [b]"}}}],
+                ),
+            ]
 
         x_buttons = [
             dict(label="X linear (MeV)", method="update", args=[{"x": x_mev_all}, {"xaxis": _xaxis_linear_MeV()}]),
@@ -1354,12 +1425,59 @@ def plot_xs(
             ),
         ]
 
+        show_mode_buttons = not single_nuclide  # <- replace single_nuclide with your actual flag if named differently
+        
+        # Build updatemenus dynamically
+        menus = [
+            # Y toggle: outside left of y-axis/title
+            dict(
+                type="buttons",
+                direction="down",
+                x=-0.25, xanchor="left",
+                y=1.0,   yanchor="top",
+                showactive=True,
+                buttons=y_buttons,
+                font=dict(size=11),
+            ),
+            # X toggle: below x-axis title/ticks
+            dict(
+                type="buttons",
+                direction="right",
+                x=0.50, xanchor="center",
+                y=-0.18, yanchor="top",
+                showactive=True,
+                buttons=x_buttons,
+                font=dict(size=11),
+            ),
+        ]
+        
+        # Only add the mode buttons row for material/element cases
+        if show_mode_buttons:
+            menus.append(
+                dict(
+                    type="buttons",
+                    direction="right",
+                    x=0.50, xanchor="center",
+                    y=-0.30, yanchor="top",
+                    showactive=True,
+                    buttons=mode_buttons,
+                    font=dict(size=11),
+                )
+            )
+        
+        # Adjust bottom margin depending on whether we have 2 rows of buttons or 1
+        bottom_margin = 170 if not show_mode_buttons else 210
+        
         fig.update_layout(
             title=dict(text=title_text, x=0.5, xanchor="center"),
             height=650,
-            margin=dict(t=90, b=210, l=155, r=260),
+        
+            # margins: reduce bottom space when mode buttons are removed
+            margin=dict(t=90, b=bottom_margin, l=155, r=260),
+        
             xaxis=_xaxis_linear_MeV(),
             yaxis=y_micro_log,
+        
             legend=dict(
                 orientation="v",
                 x=1.02,
@@ -1370,41 +1488,9 @@ def plot_xs(
                 tracegroupgap=2,
                 itemsizing="constant",
             ),
-            updatemenus=[
-                dict(
-                    type="buttons",
-                    direction="down",
-                    x=-0.25,
-                    xanchor="left",
-                    y=1.0,
-                    yanchor="top",
-                    showactive=True,
-                    buttons=y_buttons,
-                    font=dict(size=11),
-                ),
-                dict(
-                    type="buttons",
-                    direction="right",
-                    x=0.50,
-                    xanchor="center",
-                    y=-0.18,
-                    yanchor="top",
-                    showactive=True,
-                    buttons=x_buttons,
-                    font=dict(size=11),
-                ),
-                dict(
-                    type="buttons",
-                    direction="right",
-                    x=0.50,
-                    xanchor="center",
-                    y=-0.30,
-                    yanchor="top",
-                    showactive=True,
-                    buttons=mode_buttons,
-                    font=dict(size=11),
-                ),
-            ],
+        
+            updatemenus=menus,
         )
 
         fig.show()
+
