@@ -794,25 +794,34 @@ def _rank_rows_for_group(
                     }
                 )
             else:
-                cs = cross_section_at_energy(nuc, mt, temperature=T, neutron_energy=E0, xs_xml_path=xs_xml_path)
+                cs = cross_section_at_energy(
+                    nuc, mt,
+                    temperature=T,
+                    neutron_energy=E0,
+                    xs_xml_path=xs_xml_path
+                )
                 if cs is None:
                     continue
-                metric = w * float(cs["xs_b"])
-                rows.append(
-                    {
-                        "nuclide": nuc,
-                        "frac": frac,
-                        "ptype": ptype,
-                        "req": req,
-                        "mt": int(cs["mt"]),
-                        "rxname": cs["reaction_name"],
-                        "xs_b": float(cs["xs_b"]),
-                        "E_MeV": float(cs["E_MeV"]),
-                        "T": cs["temperature"],
-                        "metric": metric,
-                        "mode": "point",
-                    }
-                )
+            
+                xs_val = float(cs["xs_b"])
+                if (not np.isfinite(xs_val)) or (xs_val <= 0.0):
+                    continue  # drop zero/negative/non-finite point XS
+            
+                metric = w * xs_val
+                rows.append({
+                    "nuclide": nuc,
+                    "frac": frac,
+                    "ptype": ptype,
+                    "req": req,
+                    "mt": int(cs["mt"]),
+                    "rxname": cs["reaction_name"],
+                    "xs_b": xs_val,
+                    "E_MeV": float(cs["E_MeV"]),
+                    "T": cs["temperature"],
+                    "metric": metric,
+                    "mode": "point",
+                })
+
 
     rows.sort(key=lambda r: r["metric"], reverse=True)
     if top_n is not None:
