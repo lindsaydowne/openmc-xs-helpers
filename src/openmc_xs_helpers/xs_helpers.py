@@ -305,6 +305,24 @@ def _element_to_nuclides(
     return natural_present if natural_present else present
 
 
+def _element_isotope_rows(element_symbol: str, xs_xml_path=None, natural_only: bool = True):
+    """
+    Build nuclide_rows for an element target, including natural abundance
+    where available, so tables can show Frac/Type.
+    """
+    el = element_symbol[0].upper() + element_symbol[1:].lower()
+    nucs = _element_to_nuclides(el, xs_xml_path=xs_xml_path, natural_only=natural_only)
+
+    w = _natural_isotope_weights(el)  # dict nuclide -> fraction (sums to 1), or None
+    rows = []
+    for n in nucs:
+        if w and n in w:
+            rows.append({"name": n, "percent": 100.0 * float(w[n]), "percent_type": "ao"})
+        else:
+            rows.append({"name": n, "percent": float("nan"), "percent_type": ""})
+    return rows
+
+
 # ==========================================================
 # Target resolver
 # ==========================================================
@@ -346,8 +364,7 @@ def _resolve_targets(targets: Any, xs_xml_path: str | Path | None = None) -> lis
                 s = str(item).strip()
                 if _is_element_symbol(s):
                     el = s[0].upper() + s[1:].lower()
-                    nucs = _element_to_nuclides(el, xs_xml_path=xs_xml_path, natural_only=True)
-                    rows = [{"name": n, "percent": float("nan"), "percent_type": ""} for n in nucs]
+                    rows = _element_isotope_rows(el, xs_xml_path=xs_xml_path, natural_only=True)
                     groups.append(
                         {
                             "title": f"{el}",
@@ -389,7 +406,16 @@ def _resolve_targets(targets: Any, xs_xml_path: str | Path | None = None) -> lis
             all_nucs.append(_normalize_nuclide_name(s))
 
     all_nucs = sorted(set(all_nucs))
-    rows = [{"name": n, "percent": float("nan"), "percent_type": ""} for n in all_nucs]
+    rows = []
+    for n in all_nucs:
+        m = re.match(r"^([A-Za-z]{1,2})(\d+)$", n)
+        if m:
+            el = m.group(1)[0].upper() + m.group(1)[1:].lower()
+            w = _natural_isotope_weights(el)
+            if w and n in w:
+                rows.append({"name": n, "percent": 100.0 * float(w[n]), "percent_type": "ao"})
+                continue
+        rows.append({"name": n, "percent": float("nan"), "percent_type": ""})
 
     return [
         {
