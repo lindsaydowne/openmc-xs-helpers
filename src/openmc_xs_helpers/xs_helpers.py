@@ -23,10 +23,51 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
-import openmc
 import plotly.graph_objects as go
-from openmc.data import IncidentNeutron
-from openmc.data.reaction import REACTION_NAME
+
+# -----------------------------
+# Lazy install openmc and data
+# -----------------------------
+
+def _require_openmc():
+    try:
+        import openmc  # noqa: F401
+    except Exception as e:
+        raise ImportError(
+            "openmc is required for this function. Install/run inside an OpenMC environment."
+        ) from e
+    import openmc
+    return openmc
+
+
+def _require_openmc_data():
+    """
+    Returns (openmc, IncidentNeutron, REACTION_NAME) with imports performed lazily.
+    """
+    openmc = _require_openmc()
+    try:
+        from openmc.data import IncidentNeutron
+        from openmc.data.reaction import REACTION_NAME
+    except Exception as e:
+        raise ImportError(
+            "openmc.data is required for this function. Use an OpenMC environment with nuclear data installed."
+        ) from e
+    return openmc, IncidentNeutron, REACTION_NAME
+
+# Lazily populated OpenMC globals (so importing this module works without OpenMC)
+openmc = None
+IncidentNeutron = None
+REACTION_NAME = None
+
+def _ensure_openmc_loaded() -> None:
+    """
+    Populate module globals (openmc, IncidentNeutron, REACTION_NAME) once, on demand.
+    """
+    global openmc, IncidentNeutron, REACTION_NAME
+    if openmc is not None and IncidentNeutron is not None and REACTION_NAME is not None:
+        return
+    openmc, IncidentNeutron, REACTION_NAME = _require_openmc_data()
+
 
 # -----------------------------
 # Defaults (fusion energy range)
@@ -55,8 +96,8 @@ __all__ = [
 # xs_xml_path (str) -> {"nuclide_to_h5": dict[str, Path], "element_to_nucs": dict[str, list[str]]}
 _XSXML_MAP_CACHE: dict[str, dict[str, Any]] = {}
 
-# h5_path (str) -> IncidentNeutron
-_INCIDENT_NEUTRON_CACHE: dict[str, IncidentNeutron] = {}
+# h5_path (str) -> IncidentNeutron | None
+_INCIDENT_NEUTRON_CACHE: dict[str, IncidentNeutron | None] = {}
 
 
 # -----------------------------
@@ -86,7 +127,8 @@ class AvailableReactions:
     def __str__(self):
         if not self.mts:
             return "<no reactions>"
-        return ", ".join(f"{REACTION_NAME.get(mt, f'MT{mt}')} (MT={mt})" for mt in self.mts)
+        rxmap = REACTION_NAME or {}
+        return ", ".join(f"{rxmap.get(mt, f'MT{mt}')} (MT={mt})" for mt in self.mts)
 
 
 # -----------------------------
@@ -181,6 +223,8 @@ def _xs_xml_path(xs_xml_path: str | Path | None = None) -> Path:
     if xs_xml_path is not None:
         return Path(xs_xml_path)
 
+    openmc = _require_openmc()  # <-- ensure openmc is loaded here
+
     try:
         p = openmc.config["cross_sections"]
     except Exception as e:
@@ -192,6 +236,7 @@ def _xs_xml_path(xs_xml_path: str | Path | None = None) -> Path:
     return Path(p)
 
 
+
 def _is_element_symbol(s: str) -> bool:
     s = s.strip()
     return bool(re.fullmatch(r"[A-Za-z]{1,2}", s)) and not bool(re.search(r"\d", s))
@@ -200,11 +245,18 @@ def _is_element_symbol(s: str) -> bool:
 # ==========================================================
 # cross_sections.xml parsing + IncidentNeutron caching
 # ==========================================================
-def _get_xsxml_maps(xs_xml_path: str | Path | None = None) -> tuple[dict[str, Path], dict[str, list[str]]]:
+def _get_xsxml_maps(
+    xs_xml_path: str | Path | None = None,
+) -> tuple[dict[str, Path], dict[str, list[str]]]:
     """
     Parse cross_sections.xml once and cache:
-      - nuclide_to_h5
-      - element_to_nucs (present in xs library)
+      - nuclide_to_h5 (ONLY incident-neutron nuclide entries)
+      - element_to_nucs (isotopes present in xs library for each element)
+
+    Filters out (when present in the XML):
+      - thermal scattering S(a,b)
+      - photon libraries
+      - any non-nuclide entries
     """
     xs_xml = _xs_xml_path(xs_xml_path).resolve()
     key = str(xs_xml)
@@ -223,24 +275,36 @@ def _get_xsxml_maps(xs_xml_path: str | Path | None = None) -> tuple[dict[str, Pa
     element_to_nucs: dict[str, list[str]] = {}
 
     for lib in root.findall("library"):
-        name = lib.get("materials") or lib.get("name") or ""
-        p = lib.get("path") or ""
+        name = (lib.get("materials") or lib.get("name") or "").strip()
+        p = (lib.get("path") or "").strip()
+        libtype = (lib.get("type") or "").strip().lower()
+
         if not name or not p:
+            continue
+
+        # If the XML provides a type, keep ONLY neutron/incident-neutron libraries
+        if libtype and libtype not in ("neutron", "incident_neutron", "incident-neutron"):
+            continue
+
+        # Keep ONLY nuclide-like names (filters out S(a,b) entries like c_H_in_H2O)
+        m = _NUCLIDE_RE.match(name.replace("-", "").replace(" ", ""))
+        if not m:
             continue
 
         h5 = (xs_xml.parent / p).resolve()
         nuclide_to_h5[name] = h5
 
-        m = _NUCLIDE_RE.match(name)
-        if m:
-            el = m.group(1)
-            el = el[0].upper() + el[1:].lower()
-            element_to_nucs.setdefault(el, []).append(name)
+        el = m.group(1)
+        el = el[0].upper() + el[1:].lower()
+        element_to_nucs.setdefault(el, []).append(name)
 
     for el, lst in element_to_nucs.items():
         element_to_nucs[el] = sorted(set(lst))
 
-    _XSXML_MAP_CACHE[key] = {"nuclide_to_h5": nuclide_to_h5, "element_to_nucs": element_to_nucs}
+    _XSXML_MAP_CACHE[key] = {
+        "nuclide_to_h5": nuclide_to_h5,
+        "element_to_nucs": element_to_nucs,
+    }
     return nuclide_to_h5, element_to_nucs
 
 
@@ -249,13 +313,29 @@ def _find_h5_for_nuclide(nuclide: str, xs_xml_path: str | Path | None = None) ->
     return nuclide_to_h5.get(nuclide, None)
 
 
-def _get_incident_neutron(h5_path: Path) -> IncidentNeutron:
+def _get_incident_neutron(h5_path: Path):
+    """
+    Load an IncidentNeutron object from an OpenMC HDF5 file with caching.
+
+    Returns:
+        IncidentNeutron on success, or None if the file is not a valid
+        incident-neutron nuclide HDF5 (e.g. S(a,b), photon, etc.).
+    """
+    _ensure_openmc_loaded()
+
     k = str(Path(h5_path).resolve())
-    obj = _INCIDENT_NEUTRON_CACHE.get(k)
-    if obj is None:
+    if k in _INCIDENT_NEUTRON_CACHE:
+        return _INCIDENT_NEUTRON_CACHE[k]  # may be None
+
+    try:
         obj = IncidentNeutron.from_hdf5(k)
-        _INCIDENT_NEUTRON_CACHE[k] = obj
+    except (KeyError, OSError, ValueError):
+        # KeyError commonly occurs when expected attrs like 'Z'/'A' are missing.
+        obj = None
+
+    _INCIDENT_NEUTRON_CACHE[k] = obj
     return obj
+
 
 
 # -----------------------------
@@ -264,20 +344,38 @@ def _get_incident_neutron(h5_path: Path) -> IncidentNeutron:
 def _natural_isotope_weights(element_symbol: str) -> dict[str, float] | None:
     """
     Returns dict like {"Gd152": 0.002, ...} for naturally occurring isotopes,
-    normalized to sum to 1. Uses OpenMC NATURAL_ABUNDANCE if available.
-    """
-    el = element_symbol[0].upper() + element_symbol[1:].lower()
-    try:
-        from openmc.data import NATURAL_ABUNDANCE  # type: ignore
+    normalized to sum to 1.
 
-        out = {k: float(v) for k, v in NATURAL_ABUNDANCE.items() if k.startswith(el)}
-        out = {k: v for k, v in out.items() if v > 0.0}
-        s = sum(out.values())
-        if s > 0:
-            return {k: v / s for k, v in out.items()}
-        return None
+    Uses OpenMC's NATURAL_ABUNDANCE if available.
+
+    Notes:
+    - This function assumes `_ensure_openmc_loaded()` exists and sets the module-level
+      `openmc` global (and that openmc.data is importable in the OpenMC environment).
+    - If OpenMC isn't available (e.g., on Windows without OpenMC), it returns None.
+    """
+    try:
+        _ensure_openmc_loaded()  # populates openmc / openmc.data availability
     except Exception:
         return None
+
+    el = element_symbol[0].upper() + element_symbol[1:].lower()
+
+    try:
+        from openmc.data import NATURAL_ABUNDANCE  # type: ignore
+    except Exception:
+        return None
+
+    # Keep only isotopes of this element with positive abundance
+    out = {k: float(v) for k, v in NATURAL_ABUNDANCE.items() if k.startswith(el) and float(v) > 0.0}
+    if not out:
+        return None
+
+    s = float(sum(out.values()))
+    if s <= 0.0:
+        return None
+
+    return {k: v / s for k, v in out.items()}
+
 
 
 def _element_to_nuclides(
@@ -338,6 +436,8 @@ def _resolve_targets(targets: Any, xs_xml_path: str | Path | None = None) -> lis
 
     Returns list of groups (dicts).
     """
+    openmc = _require_openmc()  # <-- critical: ensure openmc is loaded here
+
     items = _as_list(targets)
     if not items:
         raise ValueError("No targets provided.")
@@ -473,9 +573,9 @@ def _parse_mt_or_reaction(data: IncidentNeutron, reaction_or_mt: Any, nuc: str) 
 def _excluded_default_mts(exclude_scattering: bool = True, exclude_derived: bool = True) -> set[int]:
     excluded: set[int] = set()
     if exclude_scattering:
-        excluded |= set(range(53, 92))
+        excluded |= set(range(53, 92)) # 
     if exclude_derived:
-        excluded |= set(range(301, 902))
+        excluded |= set(range(219, 999)) # 
     return excluded
 
 
@@ -493,6 +593,8 @@ def available_library_reactions(
 
     This is a *global* library query (not target-specific).
     """
+    
+
     nuclide_to_h5, _ = _get_xsxml_maps(xs_xml_path=xs_xml_path)
 
     items = list(nuclide_to_h5.items())
@@ -506,23 +608,30 @@ def available_library_reactions(
 
     mts = set()
     missing = 0
-
+    skipped = 0
+    
     for nuc, h5 in items:
         h5 = Path(h5)
         if not h5.exists():
             missing += 1
             continue
         data = _get_incident_neutron(h5)
+        if data is None:
+            missing += 1
+            skipped += 1
+            continue
+        
         for mt in map(int, data.reactions.keys()):
             if mt not in excluded:
                 mts.add(mt)
+
 
     mts = sorted(mts)
 
     if verbose:
         xs_xml = _xs_xml_path(xs_xml_path)
         print(f"cross_sections.xml: {xs_xml}")
-        print(f"nuclides scanned: {len(items)} (missing files: {missing})")
+        print(f"nuclides scanned: {len(items)} (missing files: {missing}, skipped non-neutron: {skipped})")
         print(f"unique MTs found: {len(mts)}")
 
     return AvailableReactions(mts, label="library") if as_available_reactions else mts
@@ -548,9 +657,12 @@ def available_reactions(
             if h5 is None or not Path(h5).exists():
                 continue
             data = _get_incident_neutron(h5)
+            if data is None:
+                continue
             for mt in map(int, data.reactions.keys()):
                 if mt not in excluded:
                     all_mts.add(mt)
+
 
     mts = sorted(all_mts)
     if max_items is not None and len(mts) > max_items:
@@ -577,7 +689,9 @@ def _load_rx_xs_points(
         return None
 
     data = _get_incident_neutron(h5)
-
+    if data is None:
+        return None
+    
     mt, _ = _parse_mt_or_reaction(data, reaction_or_mt, nuc)
     if mt is None:
         return None
@@ -690,7 +804,9 @@ def cross_section_at_energy(
         return None
 
     data = _get_incident_neutron(h5)
-
+    if data is None:
+        return None
+    
     mt, _ = _parse_mt_or_reaction(data, reaction_or_mt, nuc)
     if mt is None:
         return None
@@ -742,6 +858,8 @@ def _collect_available_mts_for_nuclide(
     if h5 is None or not Path(h5).exists():
         return []
     data = _get_incident_neutron(h5)
+    if data is None:
+        return []
     return [int(mt) for mt in map(int, data.reactions.keys()) if int(mt) not in excluded_mts]
 
 
@@ -812,6 +930,9 @@ def _rank_rows_for_group(
             if h5 is None or not Path(h5).exists():
                 continue
             data = _get_incident_neutron(h5)
+            if data is None:
+                continue
+            
             for req in req_mts:
                 mt, _ = _parse_mt_or_reaction(data, req, nuc)
                 if mt is not None:
@@ -829,7 +950,10 @@ def _rank_rows_for_group(
                 )
                 if pk is None:
                     continue
-                metric = w * float(pk["xs_b_peak"])
+                xs_val = float(pk["xs_b_peak"])
+                xs_scaled = (w * xs_val) if scale_by_atom_fraction else xs_val
+                metric = xs_scaled
+                
                 rows.append(
                     {
                         "nuclide": nuc,
@@ -838,7 +962,8 @@ def _rank_rows_for_group(
                         "req": req,
                         "mt": int(pk["mt"]),
                         "rxname": pk["reaction_name"],
-                        "xs_b": float(pk["xs_b_peak"]),
+                        "xs_b": xs_val,               # raw microscopic peak
+                        "xs_b_scaled": xs_scaled,     # scaled (or raw if not scaling)
                         "E_MeV": float(pk["E_MeV_peak"]),
                         "T": pk["temperature"],
                         "metric": metric,
@@ -857,9 +982,11 @@ def _rank_rows_for_group(
             
                 xs_val = float(cs["xs_b"])
                 if (not np.isfinite(xs_val)) or (xs_val <= 0.0):
-                    continue  # drop zero/negative/non-finite point XS
-            
-                metric = w * xs_val
+                    continue
+                
+                xs_scaled = (w * xs_val) if scale_by_atom_fraction else xs_val
+                metric = xs_scaled  # rank by what you are actually showing
+                
                 rows.append({
                     "nuclide": nuc,
                     "frac": frac,
@@ -867,12 +994,14 @@ def _rank_rows_for_group(
                     "req": req,
                     "mt": int(cs["mt"]),
                     "rxname": cs["reaction_name"],
-                    "xs_b": xs_val,
+                    "xs_b": xs_val,                # raw microscopic XS
+                    "xs_b_scaled": xs_scaled,      # scaled (or same as raw if not scaling)
                     "E_MeV": float(cs["E_MeV"]),
                     "T": cs["temperature"],
                     "metric": metric,
                     "mode": "point",
-                })
+})
+
 
 
     rows.sort(key=lambda r: r["metric"], reverse=True)
@@ -897,20 +1026,12 @@ def peak_xs_table(
     groups = _resolve_targets(targets, xs_xml_path=xs_xml_path)
     temps_in = _as_list(temperature) if temperature is not None else None
 
-    header = (
-        f"{'Nuclide':<8} "
-        f"{'Frac':>10} "
-        f"{'Type':>6} "
-        f"{'Requested':<16} "
-        f"{'MT':>4} "
-        f"{'Reaction':<16} "
-        f"{'XS_peak (b)':>14} "
-        f"{'E_peak (MeV)':>16} "
-        f"{'XS_T':>8}"
-    )
-
     for g in groups:
-        temp_list = [_normalize_temperature(g["default_xs_temp"])] if temps_in is None else [_normalize_temperature(t) for t in temps_in]
+        temp_list = (
+            [_normalize_temperature(g["default_xs_temp"])]
+            if temps_in is None
+            else [_normalize_temperature(t) for t in temps_in]
+        )
         temp_list = [t for t in temp_list if t is not None]
 
         for T in temp_list:
@@ -927,6 +1048,20 @@ def peak_xs_table(
             )
 
             scale_txt = " (scaled by atom fraction)" if scaled else ""
+
+            xs_col = "XS_peak (b)×a" if scaled else "XS_peak (b)"
+            header = (
+                f"{'Nuclide':<8} "
+                f"{'Frac':>10} "
+                f"{'Type':>6} "
+                f"{'Requested':<16} "
+                f"{'MT':>4} "
+                f"{'Reaction':<16} "
+                f"{xs_col:>14} "
+                f"{'E_peak (MeV)':>16} "
+                f"{'XS_T':>8}"
+            )
+
             print(f"\n{g['title']} | Requested: {requested_label}{scale_txt} | XS temperature: {T}")
             print(header)
             print("-" * len(header))
@@ -934,6 +1069,8 @@ def peak_xs_table(
             for r in rows:
                 frac = r["frac"]
                 frac_str = f"{frac:10.4g}" if frac == frac else f"{'':>10}"
+                xs_to_print = r.get("xs_b_scaled", r["xs_b"]) if scaled else r["xs_b"]
+
                 print(
                     f"{r['nuclide']:<8} "
                     f"{frac_str} "
@@ -941,10 +1078,11 @@ def peak_xs_table(
                     f"{str(r['req']):<16} "
                     f"{r['mt']:4d} "
                     f"{r['rxname']:<16} "
-                    f"{r['xs_b']:14.4g} "
+                    f"{xs_to_print:14.4g} "
                     f"{r['E_MeV']:16.5g} "
                     f"{r['T']:>8}"
                 )
+
 
 
 def find_xs_table(
@@ -962,33 +1100,12 @@ def find_xs_table(
     temps_in = _as_list(temperature) if temperature is not None else None
     E0 = _parse_energy_to_eV(neutron_energy)
 
-    if E0 is None:
-        header = (
-            f"{'Nuclide':<8} "
-            f"{'Frac':>10} "
-            f"{'Type':>6} "
-            f"{'Requested':<16} "
-            f"{'MT':>4} "
-            f"{'Reaction':<16} "
-            f"{'XS_peak (b)':>14} "
-            f"{'E_peak (MeV)':>16} "
-            f"{'XS_T':>8}"
-        )
-    else:
-        header = (
-            f"{'Nuclide':<8} "
-            f"{'Frac':>10} "
-            f"{'Type':>6} "
-            f"{'Requested':<16} "
-            f"{'MT':>4} "
-            f"{'Reaction':<16} "
-            f"{'XS (b)':>12} "
-            f"{'E (MeV)':>10} "
-            f"{'XS_T':>8}"
-        )
-
     for g in groups:
-        temp_list = [_normalize_temperature(g["default_xs_temp"])] if temps_in is None else [_normalize_temperature(t) for t in temps_in]
+        temp_list = (
+            [_normalize_temperature(g["default_xs_temp"])]
+            if temps_in is None
+            else [_normalize_temperature(t) for t in temps_in]
+        )
         temp_list = [t for t in temp_list if t is not None]
 
         for T in temp_list:
@@ -1005,6 +1122,35 @@ def find_xs_table(
             )
 
             scale_txt = " (scaled by atom fraction)" if scaled else ""
+
+            # Build header here so it can reflect whether scaling is active
+            if E0 is None:
+                xs_col = "XS_peak (b)×a" if scaled else "XS_peak (b)"
+                header = (
+                    f"{'Nuclide':<8} "
+                    f"{'Frac':>10} "
+                    f"{'Type':>6} "
+                    f"{'Requested':<16} "
+                    f"{'MT':>4} "
+                    f"{'Reaction':<16} "
+                    f"{xs_col:>14} "
+                    f"{'E_peak (MeV)':>16} "
+                    f"{'XS_T':>8}"
+                )
+            else:
+                xs_col = "XS (b)×a" if scaled else "XS (b)"
+                header = (
+                    f"{'Nuclide':<8} "
+                    f"{'Frac':>10} "
+                    f"{'Type':>6} "
+                    f"{'Requested':<16} "
+                    f"{'MT':>4} "
+                    f"{'Reaction':<16} "
+                    f"{xs_col:>12} "
+                    f"{'E (MeV)':>10} "
+                    f"{'XS_T':>8}"
+                )
+
             if E0 is None:
                 print(f"\n{g['title']} | Requested: {requested_label}{scale_txt} | XS temperature: {T}")
             else:
@@ -1016,6 +1162,7 @@ def find_xs_table(
             for r in rows:
                 frac = r["frac"]
                 frac_str = f"{frac:10.4g}" if frac == frac else f"{'':>10}"
+                xs_to_print = r.get("xs_b_scaled", r["xs_b"]) if scaled else r["xs_b"]
 
                 if E0 is None:
                     print(
@@ -1025,7 +1172,7 @@ def find_xs_table(
                         f"{str(r['req']):<16} "
                         f"{r['mt']:4d} "
                         f"{r['rxname']:<16} "
-                        f"{r['xs_b']:14.4g} "
+                        f"{xs_to_print:14.4g} "
                         f"{r['E_MeV']:16.5g} "
                         f"{r['T']:>8}"
                     )
@@ -1037,7 +1184,7 @@ def find_xs_table(
                         f"{str(r['req']):<16} "
                         f"{r['mt']:4d} "
                         f"{r['rxname']:<16} "
-                        f"{r['xs_b']:12.4g} "
+                        f"{xs_to_print:12.4g} "
                         f"{r['E_MeV']:10.5g} "
                         f"{r['T']:>8}"
                     )
@@ -1215,6 +1362,8 @@ def plot_xs(
                 if h5 is None or not Path(h5).exists():
                     continue
                 data = _get_incident_neutron(h5)
+                if data is None:
+                    continue
                 resolved = []
                 for req in req_mts:
                     mt, _ = _parse_mt_or_reaction(data, req, nuc)
