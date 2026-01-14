@@ -13,8 +13,12 @@ authors = [{name = "Lindsay Downe"}]
 dependencies = [
   "numpy",
   "plotly",
-  "openmc",
 ]
+
+[project.optional-dependencies]
+notebooks = ["jupyterlab", "nbconvert"]
+dev = ["pytest", "ruff"]
+
 
 [tool.setuptools]
 package-dir = {"" = "src"}
